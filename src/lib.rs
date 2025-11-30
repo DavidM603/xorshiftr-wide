@@ -4,6 +4,11 @@ const DEFAULT_SHR: u32 = 23;
 
 /// A prng designed for autovectorized filling of buffers with random bits,
 /// built from several lanes of individual modified 'xorshiftR+' prngs.
+///
+/// The `LANES` const generic's default of 16 compiles well on x86-64 with either
+/// 128-bit or 256-bit SIMD registers available. Tweaks may squeeze out higher
+/// performance on other architectures, but much lower values produce lower
+/// quality output.
 #[derive(Clone, Copy, Debug)]
 pub struct XorshiftrWide<const LANES: usize = 16> {
     state: [[u64; LANES]; 2],
@@ -17,12 +22,14 @@ impl<const LANES: usize> XorshiftrWide<LANES> {
                     *ptr = provide_random_u64();
                 }
             }
-            // Check if any two states are the same
-            // In the rare event that they are, we need to reseed
             let mut need_to_reseed = false;
+            // Check if any lane's two state u64s are the same
+            // In testing on smaller bit widths, abnormally short periods included a state with both the same
+            // In the rare event that we have two of the same u64 in a lane, we should reseed
             for i in 0..LANES {
                 need_to_reseed |= self.state[0][i] == self.state[1][i];
             }
+            // Check if any two lanes' entire states are the same
             for left in 0..LANES {
                 for right in (left + 1)..LANES {
                     let top_same = self.state[0][left] == self.state[0][right];
@@ -33,6 +40,8 @@ impl<const LANES: usize> XorshiftrWide<LANES> {
             }
             need_to_reseed
         } {
+            // It's astronomically unlikely that we ever need to repeat seeding here,
+            // so avoiding branches during the above checks and dropping a cold hint seems reasonable.
             cold();
         }
     }
@@ -73,22 +82,10 @@ impl<const LANES: usize> XorshiftrWide<LANES> {
         let tail = exact_width_chunks.into_remainder();
         if !tail.is_empty() {
             cold();
-            let randomized_buf: [u64; LANES] = std::array::from_fn(|i| {
-                let mut x = self.state[0][i];
-                let y = self.state[1][i];
-                self.state[0][i] = y;
-                if const { SHL_FIRST } {
-                    x ^= x << SHL_BY;
-                    x ^= x >> SHR_BY;
-                } else {
-                    x ^= x >> SHR_BY;
-                    x ^= x << SHL_BY;
-                }
-                self.state[1][i] = x.wrapping_add(y);
-                x
-            });
+            let mut temporary_buffer = [0u64; LANES];
+            self.fill_core::<SHL_FIRST, SHL_BY, SHR_BY>(&mut temporary_buffer[..]);
             let qty_to_copy = tail.len();
-            let random_bits_to_copy = &randomized_buf[..qty_to_copy];
+            let random_bits_to_copy = &temporary_buffer[..qty_to_copy];
             tail.copy_from_slice(random_bits_to_copy);
         }
     }
